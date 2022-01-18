@@ -24,7 +24,6 @@ app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY')
 hp.open_browser()
 
-
 @app.route('/')
 def request_auth():
     # Auth flow step 1 - request authorization
