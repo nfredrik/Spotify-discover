@@ -1,34 +1,34 @@
-from flask import Flask, redirect, request, session
-from datetime import datetime, timedelta, date
-from dotenv import load_dotenv
-import helpers as hp
+import os
+from datetime import datetime, timedelta
+
 import numpy as np
 import requests
-import base64
-import json
-import os
+from dotenv import load_dotenv
+from flask import Flask, redirect, request, session
 
-load_dotenv() # load environment variables
+import helpers as hp
+from tokens_storage import TokensStorage
+
+load_dotenv()  # load environment variables
 
 # client info
 CLIENT_ID = os.getenv('SPOTIFY_CLIENT_ID')
 CLIENT_SECRET = os.getenv('SPOTIFY_CLIENT_SECRET')
-REDIRECT_URI = os.getenv('SPOTIFY_REDIRECT_URI') # URI to redirect to after granting user permission
+REDIRECT_URI = os.getenv('SPOTIFY_REDIRECT_URI')  # URI to redirect to after granting user permission
 USER_ID = os.getenv('SPOTIFY_USER_ID')
-
-# spotify API endpoints
-SPOTIFY_TOKEN_URL = 'https://accounts.spotify.com/api/token'
-MY_FOLLOWED_ARTISTS_URL = 'https://api.spotify.com/v1/me/following?type=artist'
 
 app = Flask(__name__)
 app.secret_key = os.getenv('SECRET_KEY')
 hp.open_browser()
+token_store = TokensStorage()
+
 
 @app.route('/')
 def request_auth():
     # Auth flow step 1 - request authorization
     scope = 'user-top-read playlist-modify-public playlist-modify-private user-follow-read'
-    return redirect(f'https://accounts.spotify.com/authorize?client_id={CLIENT_ID}&response_type=code&redirect_uri={REDIRECT_URI}&scope={scope}')
+    return redirect(
+        f'https://accounts.spotify.com/authorize?client_id={CLIENT_ID}&response_type=code&redirect_uri={REDIRECT_URI}&scope={scope}')
 
 
 @app.route('/callback')
@@ -36,22 +36,10 @@ def request_tokens():
     # get code from spotify req param
     code = request.args.get('code')
 
-    # necessary request body params
-    payload = {
-        'grant_type': 'authorization_code',
-        'code': code,
-        'redirect_uri': REDIRECT_URI,
-        'client_id': CLIENT_ID,
-        'client_secret': CLIENT_SECRET
-    }
-    # Auth flow step 2 - request refresh and access tokens
-    r = requests.post(SPOTIFY_TOKEN_URL, data=payload)
-    response = r.json() # parse json
-
-    # store tokens
+    response = hp.post_mermer(code, REDIRECT_URI, CLIENT_ID, CLIENT_SECRET)
     hp.store_tokens(response)
-    print(f'{r.status_code} - Successfully completed Auth flow!')
-
+    token_store.store_tokens(response)
+    print(f' - Successfully completed Auth flow!')
     return redirect('/get_artists')
 
 
@@ -60,24 +48,19 @@ def request_tokens():
 def get_artists():
     tokens = hp.get_tokens()
     hp.check_expiration(tokens)
+    token_store.check_expiration(tokens)
 
     # Get request to followed artists endpoint
     headers = {'Authorization': f'Bearer {tokens["access_token"]}'}
-    r = requests.get(MY_FOLLOWED_ARTISTS_URL, headers=headers)
-    response = r.json()
+    response = hp.follow_artist_url(tokens)
 
-    artist_ids = []
-    artists = response['artists']['items']
-    for artist in artists:
-        artist_ids.append(artist['id'])
+    artist_ids = [artist['id'] for artist in response['artists']['items']]
 
     # While next results page exists, get it and its artist_ids
-    while response['artists']['next']:
-        next_page_uri = response['artists']['next']
+    while next_page_uri:= response['artists']['next']:
         r = requests.get(next_page_uri, headers=headers)
         response = r.json()
-        for artist in response['artists']['items']:
-            artist_ids.append(artist['id'])
+        artist_ids += [artist['id'] for artist in response['artists']['items']]
 
     print('Retrieved artist IDs!')
     session['artist_ids'] = artist_ids
@@ -90,36 +73,36 @@ def get_artists():
 def get_albums():
     tokens = hp.get_tokens()
     hp.check_expiration(tokens)
+    token_store.check_expiration(tokens)
+
     artist_ids = session['artist_ids']
     album_ids = []
-    album_names = {} # used to check for duplicates with different id's * issue with some albums
+    album_names = {}  # used to check for duplicates with different id's * issue with some albums
 
     # set time frame for new releases (4 weeks)
-    today = datetime.now()
     number_weeks = timedelta(weeks=4)
-    time_frame = (today - number_weeks).date()
+    time_frame = (datetime.now() - number_weeks).date()
 
     for id in artist_ids:
-        uri = f'https://api.spotify.com/v1/artists/{id}/albums?include_groups=album,single&country=US'
-        headers = {'Authorization': f'Bearer {tokens["access_token"]}'}
-        r = requests.get(uri, headers=headers)
-        response = r.json()
-
+        response = hp.url_get_albums(id, tokens)
         albums = response['items']
         for album in albums:
             # check for tracks that are new releases (4 weeks)
             try:
-                release_date = datetime.strptime(album['release_date'], '%Y-%m-%d') # convert release_date string to datetime
-                album_name = album['name']
-                artist_name = album['artists'][0]['name']
-                if release_date.date() > time_frame:
-                    # if we do find a duplicate album name, check if it's by a different artist
-                    if album_name not in album_names or artist_name != album_names[album_name]:
-                        album_ids.append(album['id'])
-                        album_names[album_name] = artist_name
+                release_date = datetime.strptime(album['release_date'],
+                                                 '%Y-%m-%d')  # convert release_date string to datetime
             except ValueError:
                 # there appear to be some older release dates that only contain year (2007) - irrelevant
                 print(f'Release date found with format: {album["release_date"]}')
+                continue
+
+            album_name = album['name']
+            artist_name = album['artists'][0]['name']
+            if release_date.date() > time_frame:
+                # if we do find a duplicate album name, check if it's by a different artist
+                if album_name not in album_names or artist_name != album_names[album_name]:
+                    album_ids.append(album['id'])
+                    album_names[album_name] = artist_name
 
     session['album_ids'] = album_ids
     print('Retrieved album IDs!')
@@ -135,13 +118,9 @@ def get_tracks():
     track_uris = []
 
     for id in album_ids:
-        uri = f'https://api.spotify.com/v1/albums/{id}/tracks'
-        headers = {'Authorization': f'Bearer {tokens["access_token"]}'}
-        r = requests.get(uri, headers=headers)
-        response = r.json()
+        response = hp.require_tracks(id, tokens)
 
-        for track in response['items']:
-            track_uris.append(track['uri'])
+        track_uris += [track['uri'] for track in response['items']]
 
     hp.store_track_uris(track_uris)
     print('Retrieved tracks!')
@@ -154,20 +133,13 @@ def get_tracks():
 def create_playlist():
     tokens = hp.get_tokens()
     hp.check_expiration(tokens)
-    current_date = (date.today()).strftime('%m-%d-%Y')
-    playlist_name = f'New Monthly Releases - {current_date}'
 
-    # make request to create_playlist endpoint
-    uri = f'https://api.spotify.com/v1/users/{USER_ID}/playlists'
-    headers = {'Authorization': f'Bearer {tokens["access_token"]}', 'Content-Type': 'application/json'}
-    payload = {'name': playlist_name}
-    r = requests.post(uri, headers=headers, data=json.dumps(payload))
-    response = r.json()
+    response = hp.post_create_playlist(USER_ID, tokens)
 
-    session['playlist_id'] = response['id'] # store our new playlist's id
-    session['playlist_url'] = response['external_urls']['spotify'] # store new playlist's url
+    session['playlist_id'] = response['id']  # store our new playlist's id
+    session['playlist_url'] = response['external_urls']['spotify']  # store new playlist's url
 
-    print(f'{r.status_code} - Created playlist!')
+    print(f' - Created playlist!')
     return redirect('/add_to_playlist')
 
 
@@ -186,17 +158,27 @@ def add_to_playlist():
     # split track_uris list into 3 sub lists
     if number_of_tracks > 200:
         three_split = np.array_split(tracks_list, 3)
+        test = hp.final_list(tracks_list, 3)
         for lst in three_split:
             hp.add_tracks(tokens, playlist_id, list(lst))
 
     # split track_uris list into 2 sub lists
     elif number_of_tracks > 100:
         two_split = np.array_split(tracks_list, 2)
+        test = hp.final_list(tracks_list, 2)
         for lst in two_split:
             hp.add_tracks(tokens, playlist_id, list(lst))
 
     else:
         hp.add_tracks(tokens, playlist_id, tracks_list)
+
+    match number_of_tracks:
+        case x if x > 200:
+            pass
+        case x if x > 100:
+            pass
+        case _:
+            pass
 
     print('Added tracks to playlist!')
 
@@ -209,16 +191,8 @@ def add_to_playlist():
 @app.route('/refresh')
 def refresh_tokens():
     tokens = hp.get_tokens()
-    payload = {
-        'grant_type': 'refresh_token',
-        'refresh_token': tokens['refresh_token']
-    }
-    base64encoded = str(base64.b64encode(f'{CLIENT_ID}:{CLIENT_SECRET}'.encode('ascii')), 'ascii')
-    headers = {'Authorization': f'Basic {base64encoded}'}
 
-    # post request for new tokens
-    r = requests.post(SPOTIFY_TOKEN_URL, data=payload, headers=headers)
-    response = r.json()
+    response = hp.post_refresh(CLIENT_ID, CLIENT_SECRET, tokens)
     hp.refresh_tokens(response['access_token'], tokens['refresh_token'], response['expires_in'])
 
     print('Tokens refreshed!')
@@ -226,4 +200,4 @@ def refresh_tokens():
 
 
 if __name__ == '__main__':
-   app.run()
+    app.run()
